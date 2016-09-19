@@ -1,0 +1,165 @@
+#include <iostream>
+#include <Eigen>
+
+using namespace std;
+using namespace Eigen;
+
+//void update(MatrixXf z,Matrix2f R,VectorXf x_hat_min)
+void update(VectorXf &x_hat_min,MatrixXf &P_min,MatrixXf z,Matrix2f R,float g_match,float g_newlm)
+{
+	int n_z = z.cols();
+	MatrixXf z_value(2,n_z);
+	MatrixXf Rpi(2*n_z,2); 	
+	
+	int n_m = (x_hat_min.rows()-3)/2;
+	MatrixXf res(2,1);
+	MatrixXf diagS(2,2);
+	
+	// Precomputations 
+	// Initializing J matrix
+	Matrix2f J;
+	J << 0,-1,1,0;
+	Matrix2f I;
+	I.setIdentity(2,2) ;
+	Matrix2f G;
+	// compute the relative position measurements and covariance
+	for(int i=0;i<n_z;i++)
+	{
+		Vector2f Ang;
+		Ang << cos(z(1,i)),sin(z(1,i)) ;
+		z_value.block<2,1>(0,i) = z_value(0,i)* Ang.transpose();
+		G << cos(z_value(1,i)), -z_value(0,i)*sin(z_value(1,i)), sin(z_value(1,i)), z_value(0,i)*cos(z_value(1,i));
+		Rpi.block<2,2>(2*i,0) = G*R*G.transpose();
+	}
+	// Data association
+	// cycle through alll measurements
+	for(int j=0;j<n_z;j++)
+	{
+		// Precomputation
+		Matrix2f C;
+		C << cos(x_hat_min(3)), -sin(x_hat_min(3)), sin(x_hat_min(3)), cos(x_hat_min(3)) ;
+		MatrixXf rij(2,n_m);
+		int x_s = x_hat_min.rows();
+		MatrixXf Hj(2*n_m,x_s);
+		MatrixXf Sij_inv(2*n_m,2);
+		VectorXf mdij(n_m);
+		
+		// Compare measurement i with landmark j already in the map
+		// Compute the Mahalanobis Distance mdij
+		float minmd = -1;
+		int count = 0;
+		for(int k=0;k<n_m;k++)
+		{
+			int lmj_inds = 3+2*j-1;
+			VectorXf x_inter(2);
+			x_inter(0) = x_hat_min(lmj_inds)-x_hat_min(0);
+			x_inter(1) = x_hat_min(lmj_inds+1)-x_hat_min(1);
+			// expected measurement 
+			MatrixXf z_hat_j(2,1);
+			z_hat_j.block<2,1>(0,0) = C * x_inter;
+			MatrixXf H_inter(2,3);
+			H_inter.block<2,2>(0,0) = I;
+			H_inter.block<2,1>(0,2) = J * x_inter;
+			
+			Hj.block<2,3>(2*k,0) = -C.transpose()*H_inter;
+			Hj.block<2,2>(2*k,lmj_inds) = C.transpose();
+			
+			rij.block<2,1>(0,k) = z_value.block<2,1>(0,k) - z_hat_j;
+			Matrix2f S_inter;
+			S_inter.block<2,2>(0,0) = Hj.block(2,x_s,2*k,0) * P_min * Hj.block(2,x_s,2*k,0).transpose()+ Rpi.block<2,2>(0,2*k);
+			Sij_inv.block<2,2>(2*j,0) = S_inter.inverse();
+			
+			mdij(j) = rij.block<2,1>(0,k).transpose() * Sij_inv.block<2,2>(2*j,0) * rij.block<2,1>(0,k) ;
+ 		}
+		int minj;
+		minmd = mdij.maxCoeff(&minj);
+		
+		// Update or initialize depending on min Mahalanobis distance
+		if(minmd = -1 || minmd>g_newlm)
+		{
+			// Initialize new landmark
+			cout<<"Initialize New Landmark"<<endl;
+			// Position of new landmark (Eqn 5.70)
+			VectorXf p_newlm(2);
+			p_newlm = x_hat_min .head(2) + C*z_value.block<2,1>(0,j);
+			
+			// To add state to the vector
+			x_hat_min.resize(x_s+2);
+			x_hat_min(x_s) = p_newlm(0);
+			x_hat_min(x_s+1) = p_newlm(1);
+			
+			// Jacobian
+			MatrixXf H_int(2,3);
+			H_int.block<2,2>(0,0) = I;
+			H_int.block<2,1>(0,2) = J*(p_newlm-x_hat_min.head(2));
+			
+			MatrixXf HR(2,3);
+			HR = -C.transpose()*H_int;
+			Matrix2f H_li; 
+			H_li = C.transpose();
+		
+			// Covariance Matrix
+			Matrix2f P_LL;
+			P_LL = H_li.transpose()*(HR*P_min.block<3,3>(0,0)*HR.transpose() + Rpi.block<2,2>(2*j,0))*H_li;
+			MatrixXf P_xl(x_s,2);
+			P_xl = -P_min.block(x_s,3,0,0)*HR.transpose()*H_li;
+			
+			P_min.resize(x_s+2,x_s+2);
+			P_min.block(x_s,2,0,x_s) = P_xl;
+			P_min.block(2,x_s,x_s,0) = P_xl.transpose();
+			P_min.block(2,2,x_s,x_s) = P_LL;
+		}
+		else if(minmd<g_match)
+		{
+			// match measurement to mapped landmark j
+			
+			// To calculate the condition of a matrix
+			// Formula taken from Berkley Math website
+			Matrix2f A ;
+			A = Sij_inv.block<2,2>(2*j,2);
+			float T  = A(0,0) + A(1,1);
+			float D = (A(0,0) * A(1,1)) - (A(0,1) * A(1,0));
+			float eig_1 = T/2+sqrt((T*T)/4-D);
+			float eig_2 = T/2-sqrt((T*T)/4-D) ;
+			float cond = abs(eig_1/eig_2); 
+			
+			if(cond>80)
+			{
+				cout<<"aborted due to ill conditioned S";
+				continue;
+			}
+			
+			// Kalman Gain
+			MatrixXf K(x_s,2);
+			K = P_min*Hj.block(2,x_s,2*minj,0).transpose()*Sij_inv.block(2,2,2*minj,0);
+			
+			// State update equation
+			x_hat_min = x_hat_min + K*rij.block<2,1>(0,minj);
+			MatrixXf I_val;
+			for (int iter=0;iter<x_s;iter++)
+			{
+				for(int iter_2=0;iter_2<x_s;iter_2++)
+				{
+					if(iter == iter_2)
+						I_val(iter,iter) = 1;
+					else
+						I_val(iter,iter_2) = 0;
+				}
+			}
+			P_min = (I_val - K* Hj.block(2,x_s,2*minj,0))*P_min*((I_val - K* Hj.block(2,x_s,2*minj,0)).transpose());
+		}
+	}
+	
+	P_min = (P_min + P_min.transpose())/2;
+	
+}
+int main()
+{
+	Matrix2f R;
+	R<< 0.01,0,0,0.01;
+	MatrixXf z(2,4);
+	z << 1, 0.5 ,2 ,0.5,3,0.5,4,0.5;
+	VectorXf x_hat(5);
+	x_hat << 1,2,3,4,5;
+	//update(z,R,x_hat);
+}
